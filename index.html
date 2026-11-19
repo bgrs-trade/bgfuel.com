@@ -626,13 +626,44 @@
     let currentUser = JSON.parse(localStorage.getItem('bg_current_user_v4')) || null;
     let offlineQueue = JSON.parse(localStorage.getItem('bg_offline_queue_v4')) || [];
 
+    function saveAuthOnly() {
+      localStorage.setItem('bg_users_v4', JSON.stringify(users));
+      localStorage.setItem('bg_current_user_v4', JSON.stringify(currentUser));
+    }
+
+    function recomputeStationsFromLogs() {
+      const resetCount = Number(localStorage.getItem('bg_reset_counter_v7') || '0');
+      const base = INITIAL_STATIONS.map(s => ({
+        ...s,
+        dieselIn: resetCount > 0 ? 0 : s.dieselIn,
+        dieselOut: resetCount > 0 ? 0 : s.dieselOut,
+        benzineIn: resetCount > 0 ? 0 : s.benzineIn,
+        benzineOut: resetCount > 0 ? 0 : s.benzineOut
+      }));
+      const byId = new Map(base.map(s => [s.id, s]));
+      const chronological = [...logs].sort((a, b) => new Date(a.timestamp || a.date) - new Date(b.timestamp || b.date));
+      chronological.forEach(l => {
+        const st = l.stationId ? byId.get(Number(l.stationId)) : base.find(x => x.city === l.city && x.name === l.station);
+        if (!st) return;
+        const fType = l.fuelType || ((l.detail && l.detail.includes('ቤንዚን')) ? 'benzine' : 'diesel');
+        const amt = Number(l.liters) || 0;
+        if (l.action === 'ኮታ ገቢ') {
+          if (fType === 'diesel') st.dieselIn += amt;
+          else st.benzineIn += amt;
+        } else if (l.action === 'ስርጭት') {
+          if (fType === 'diesel') st.dieselOut += amt;
+          else st.benzineOut += amt;
+        }
+      });
+      stations = base;
+    }
+
     function saveData(shouldPushCloud = true) {
       localStorage.setItem('bg_stations_v7', JSON.stringify(stations));
       localStorage.setItem('bg_logs_v4', JSON.stringify(logs));
       localStorage.setItem('bg_users_v4', JSON.stringify(users));
       localStorage.setItem('bg_current_user_v4', JSON.stringify(currentUser));
       localStorage.setItem('bg_offline_queue_v4', JSON.stringify(offlineQueue));
-      localStorage.setItem('bg_last_local_update_v7', String(Date.now()));
       updateSyncUI();
       if (shouldPushCloud && navigator.onLine && getCloudDbUrl()) {
         pushAllStateToCloud(false);
@@ -670,13 +701,20 @@
       }
     }
 
-    function syncOfflineRecords(manual = false) {
+    async function syncOfflineRecords(manual = false) {
       if (!navigator.onLine) {
         if (manual) showToast("⚠️ ኢንተርኔት (Network) የለም! ኔትዎርክ ሲያገኙ ወዲያውኑ Sync ይሆናል።");
         return;
       }
       if (offlineQueue.length === 0) {
-        if (manual) showToast("✅ ሁሉም መረጃዎች ቀድመው Sync ሆነዋል!");
+        if (getCloudDbUrl()) {
+          await pushAllStateToCloud(false);
+          await pullAllStateFromCloud(false);
+          await pullUsersFromCloud(false);
+          if (manual) showToast("✅ ከ Cloud Database ጋር በተሳካ ሁኔታ ተመሳስሏል!");
+        } else if (manual) {
+          showToast("✅ ሁሉም መረጃዎች ቀድመው Sync ሆነዋል!");
+        }
         return;
       }
 
@@ -754,14 +792,14 @@
       }
 
       currentUser = found;
-      saveData();
+      saveAuthOnly();
       bootApp();
     }
 
     // =========================================================================
     // REGISTRATION REQUEST CODE & CLOUD SYNC HELPERS
     // =========================================================================
-    const DEFAULT_CLOUD_DB_URL = ""; // Optional: paste your Firebase Realtime DB URL here so all phones auto-sync!
+    const DEFAULT_CLOUD_DB_URL = "https://bgrs-fuel-tracker-default-rtdb.europe-west1.firebasedatabase.app";
 
 
 
@@ -823,7 +861,7 @@
             status: 'approved'
           });
         }
-        saveData();
+        saveAuthOnly();
         document.getElementById('employeeApprovalInput').value = '';
         document.getElementById('employeeApproveBox').classList.add('hidden');
         document.getElementById('loginUser').value = data.username;
@@ -976,28 +1014,65 @@
       }
     }
 
+    function setCloudDiagnosticStatus(ok, statusMsg) {
+      const badge = document.getElementById('cloudSyncBadge');
+      const hint = document.getElementById('cloudConnectionHint');
+      if (badge) {
+        badge.textContent = ok ? 'Cloud Active' : 'Cloud Error';
+        badge.className = ok
+          ? 'text-[9px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold'
+          : 'text-[9px] px-1.5 py-0.5 rounded bg-red-100 text-red-800 font-bold';
+      }
+      if (hint && statusMsg) {
+        hint.textContent = statusMsg;
+      }
+    }
+
     async function pushAllStateToCloud(forceReset = false) {
       const baseUrl = getCloudDbUrl();
       if (!baseUrl || !navigator.onLine) return false;
       try {
-        const nextReset = Number(localStorage.getItem('bg_reset_counter_v7') || '0') + (forceReset ? 1 : 0);
         if (forceReset) {
+          const nextReset = Number(localStorage.getItem('bg_reset_counter_v7') || '0') + 1;
           localStorage.setItem('bg_reset_counter_v7', String(nextReset));
+          await fetch(`${baseUrl}/bgrs_logs.json`, { method: 'DELETE' });
+          const resReset = await fetch(`${baseUrl}/bgrs_reset.json`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resetCounter: nextReset, updatedAt: new Date().toISOString() })
+          });
+          if (!resReset.ok) {
+            setCloudDiagnosticStatus(false, `⚠️ Firebase ስህተት (${resReset.status}): በ Firebase Realtime Database -> Rules ውስጥ ".read": true እና ".write": true መሆኑን ያረጋግጡ!`);
+            return false;
+          }
+          setCloudDiagnosticStatus(true, '✅ Cloud DB ተገናኝቷል! Reset በሁሉም መሳሪያዎች ተልኳል።');
+          return true;
         }
-        const payload = {
-          stations: stations,
-          logs: logs.slice(0, 500),
-          resetCounter: nextReset,
-          updatedAt: new Date().toISOString()
-        };
-        const res = await fetch(`${baseUrl}/bgrs_state.json`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        return res.ok;
+
+        // Push each local log atomically using PATCH to /bgrs_logs.json so concurrent devices NEVER overwrite each other!
+        if (logs.length > 0) {
+          const patchBody = {};
+          logs.slice(0, 300).forEach(l => {
+            if (l && l.id) {
+              const safeId = String(l.id).replace(/[^a-zA-Z0-9_-]/g, '_');
+              patchBody[safeId] = { ...l, syncStatus: 'synced' };
+            }
+          });
+          const res = await fetch(`${baseUrl}/bgrs_logs.json`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(patchBody)
+          });
+          if (!res.ok) {
+            setCloudDiagnosticStatus(false, `⚠️ Firebase ስህተት (${res.status}): በ Firebase Realtime Database -> Rules ውስጥ ".read": true እና ".write": true መሆኑን ያረጋግጡ!`);
+            return false;
+          }
+        }
+        setCloudDiagnosticStatus(true, '✅ Cloud DB ተገናኝቷል! መረጃዎች በቀጥታ እየተለዋወጡ ነው።');
+        return true;
       } catch (e) {
         console.warn('Cloud state push error:', e);
+        setCloudDiagnosticStatus(false, '⚠️ ወደ Firebase መላክ አልተቻለም (Network ወይም CORS/Rules ችግር)።');
         return false;
       }
     }
@@ -1009,20 +1084,22 @@
         return;
       }
       try {
-        const res = await fetch(`${baseUrl}/bgrs_state.json`);
-        if (!res.ok) return;
-        const remote = await res.json();
-        if (!remote || typeof remote !== 'object') return;
-
+        // 1. Check if Super Admin triggered a reset
+        const resReset = await fetch(`${baseUrl}/bgrs_reset.json`);
+        if (!resReset.ok) {
+          setCloudDiagnosticStatus(false, `⚠️ Firebase ስህተት (${resReset.status}): በ Firebase -> Realtime Database -> Rules ውስጥ ".read": true እና ".write": true ያድርጉ!`);
+          if (showNotification) showToast(`⚠️ Firebase ፍቃድ ተከልክሏል (${resReset.status})! Rules ያስተካክሉ።`);
+          return;
+        }
+        const remoteResetObj = await resReset.json();
         const localReset = Number(localStorage.getItem('bg_reset_counter_v7') || '0');
-        const remoteReset = Number(remote.resetCounter || 0);
+        const remoteReset = Number((remoteResetObj && remoteResetObj.resetCounter) || 0);
 
-        // If Super Admin triggered a cloud reset, apply reset across devices
-        if (remoteReset > localReset && Array.isArray(remote.stations)) {
+        if (remoteReset > localReset) {
           localStorage.setItem('bg_reset_counter_v7', String(remoteReset));
-          stations = remote.stations;
-          logs = Array.isArray(remote.logs) ? remote.logs : [];
+          logs = [];
           offlineQueue = [];
+          recomputeStationsFromLogs();
           saveData(false);
           updateHeaderStats();
           renderStations();
@@ -1032,38 +1109,37 @@
           return;
         }
 
-        let changed = false;
-        if (Array.isArray(remote.logs)) {
-          const existingIds = new Set(logs.map(x => x.id));
-          const mergedLogs = [...logs];
-          let addedNew = false;
+        // 2. Pull all atomic logs from /bgrs_logs.json
+        const resLogs = await fetch(`${baseUrl}/bgrs_logs.json`);
+        if (!resLogs.ok) return;
+        const remoteLogsObj = await resLogs.json();
 
-          remote.logs.forEach(rLog => {
+        let changed = false;
+        const existingIds = new Set(logs.map(x => x.id));
+        const mergedLogs = [...logs];
+
+        if (remoteLogsObj && typeof remoteLogsObj === 'object') {
+          Object.values(remoteLogsObj).forEach(rLog => {
             if (!rLog || !rLog.id) return;
             if (!existingIds.has(rLog.id)) {
               mergedLogs.push({ ...rLog, syncStatus: 'synced' });
               existingIds.add(rLog.id);
-              addedNew = true;
+              changed = true;
             }
           });
-
-          if (addedNew) {
-            mergedLogs.sort((a, b) => new Date(b.timestamp || b.date) - new Date(a.timestamp || a.date));
-            logs = mergedLogs.slice(0, 500);
-            changed = true;
-          }
         }
 
-        if (Array.isArray(remote.stations) && remote.stations.length > 0) {
-          const remoteTime = remote.updatedAt ? new Date(remote.updatedAt).getTime() : 0;
-          const localTime = Number(localStorage.getItem('bg_last_local_update_v7') || '0');
-          if (remoteTime > localTime || logs.length === 0) {
-            stations = remote.stations;
-            changed = true;
-          }
+        // Also push any local logs that aren't in remote yet!
+        const remoteIds = new Set(remoteLogsObj && typeof remoteLogsObj === 'object' ? Object.values(remoteLogsObj).map(x => x && x.id) : []);
+        const missingOnCloud = logs.filter(l => l && l.id && !remoteIds.has(l.id));
+        if (missingOnCloud.length > 0) {
+          await pushAllStateToCloud(false);
         }
 
         if (changed) {
+          mergedLogs.sort((a, b) => new Date(b.timestamp || b.date) - new Date(a.timestamp || a.date));
+          logs = mergedLogs.slice(0, 500);
+          recomputeStationsFromLogs();
           saveData(false);
           updateHeaderStats();
           renderStations();
@@ -1072,8 +1148,10 @@
             renderAnalytics();
           }
         }
-        if (showNotification) showToast("✅ ከ Cloud አዲስ የነዳጅና የተቆጣጣሪ መረጃዎች ተመሳስለዋል!");
+        setCloudDiagnosticStatus(true, '✅ Cloud DB ተገናኝቷል! የተቆጣጣሪዎች ኮታ እና ስርጭት መረጃዎች በሁሉም ስልኮች ይለዋወጣሉ።');
+        if (showNotification) showToast(changed ? "✅ አዲስ የነዳጅ መረጃዎች ከ Cloud መጥተዋል!" : "✅ ሁሉም መረጃዎች ተመሳስለዋል (Up to date)!");
       } catch (e) {
+        setCloudDiagnosticStatus(false, '⚠️ ከ Firebase መረጃ ማምጣት አልተቻለም።');
         if (showNotification) showToast("⚠️ ከ Cloud መረጃ ማምጣት አልተቻለም።");
       }
     }
@@ -1142,7 +1220,7 @@
       // All new registrations start as 'pending' — cannot enter the app until approved!
       const newUser = { username: u, pass: p, name: name, role: role, status: 'pending' };
       users.push(newUser);
-      saveData();
+      saveAuthOnly();
       pushUserToCloud(newUser);
 
       // Generate shareable Registration Request Code so Super Admin on another phone can receive & approve it!
@@ -1162,7 +1240,7 @@
 
     function logout() {
       currentUser = null;
-      saveData();
+      saveAuthOnly();
       document.getElementById('appContainer').classList.add('hidden');
       document.getElementById('authContainer').classList.remove('hidden');
     }
@@ -1359,11 +1437,13 @@
       const now = new Date();
       const isOffline = !navigator.onLine;
       const logEntry = {
-        id: 'log-' + Date.now(),
+        id: 'log-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
         timestamp: now.toISOString(),
         date: now.toISOString().split('T')[0],
         time: now.toTimeString().slice(0, 5),
         action: "ኮታ ገቢ",
+        stationId: st.id,
+        fuelType: type,
         city: st.city,
         station: st.name,
         buyer: "-",
@@ -1416,11 +1496,13 @@
       const now = new Date();
       const isOffline = !navigator.onLine;
       const logEntry = {
-        id: 'log-' + Date.now(),
+        id: 'log-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
         timestamp: now.toISOString(),
         date: now.toISOString().split('T')[0],
         time: now.toTimeString().slice(0, 5),
         action: "ስርጭት",
+        stationId: st.id,
+        fuelType: fType,
         city: st.city,
         station: st.name,
         buyer: buyer,
@@ -1675,6 +1757,9 @@
       a.click();
     }
 
+    if (logs.length > 0) {
+      recomputeStationsFromLogs();
+    }
     pullUsersFromCloud(false);
     if (currentUser) {
       bootApp();
